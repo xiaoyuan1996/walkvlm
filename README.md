@@ -1,7 +1,15 @@
 # WalkVLM: Aid Visually Impaired People Walking by Vision-Language Model
 <p align="left">
-  📄 <a href="https://arxiv.org/pdf/2412.20903" target="_blank"><b>View the Paper</b></a>
+  📄 <a href="https://arxiv.org/pdf/2412.20903" target="_blank"><b>View the Paper (WalkVLM)</b></a>
 </p>
+
+## 🔥 Latest Updates
+
+| Timeline | Project | Description |
+|---|---|---|
+| 📄 2024.12 | **WalkVLM** | CoT-based hierarchical planning + temporal-aware adaptive prediction. First large-scale WAD dataset (12k video–annotation pairs). *(arXiv:2412.20903)* |
+| 📄 2025.08 | **[WalkVLM-LR](./WalkVLM-LR/)** | Enhanced with EAD & human-preference reward functions, further reducing output & temporal redundancy. |
+| 🆕 2026.01 | **[WalkStream](./WalkStream/)** | Data & reward-enhanced low-latency VLM. 98k WRD clips, GRPO-based reward inference, decoupled async architecture — **52.6% latency reduction**. *(IJCV submitted)* |
 
 ##  🚀 Introduction
 
@@ -47,14 +55,21 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
 ```
 .
 ├── wad_dataset               # Dataset used in WalkVLM
-└── WalkVLM-LR                # WalkVLM reasoning code
-    ├── checkpoint            # Pretrained weights
-    ├── vlm_grpo_template     # GRPO training template
-    ├── EAD.py                # EAD model code
-    ├── GPTScore.py           # GPTScore calculation code
-    ├── inference.py          # Inference script
-    ├── test.py               # Testing script
-    └── train_EAD.py          # EAD model training script
+├── WalkVLM-LR                # WalkVLM reasoning code
+│   ├── checkpoint            # Pretrained weights
+│   ├── vlm_grpo_template     # GRPO training template
+│   ├── EAD.py                # EAD model code
+│   ├── GPTScore.py           # GPTScore calculation code
+│   ├── inference.py          # Inference script
+│   ├── test.py               # Testing script
+│   └── train_EAD.py          # EAD model training script
+└── WalkStream                # 🆕 Latest: reward-enhanced low-latency VLM (IJCV submission)
+    └── src/
+        ├── otp/              # Online Triggered Prediction module
+        ├── reminder_generation/  # GRPO-based reminder generation
+        ├── infer/            # Evaluation tools (GPTScore)
+        ├── wrd_dataset/      # Walking Reminder Dataset (98k clips)
+        └── checkpoint/       # Pre-trained model weights
 ```
 
 ## 📖 Citation
