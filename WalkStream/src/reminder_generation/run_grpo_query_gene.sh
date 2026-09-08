@@ -5,6 +5,56 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+print_help() {
+    cat <<'EOF'
+Usage: bash run_grpo_query_gene.sh [additional grpo_query_gene.py args]
+
+Maintained WalkStream reminder-generation training wrapper.
+
+Default values can be overridden either by environment variables or by passing
+extra CLI flags at the end of the command.
+
+Common example:
+  bash run_grpo_query_gene.sh \
+    --dataset_path ../../wad_dataset \
+    --output_dir ../checkpoint/grpo_model \
+    --model_name_or_path Qwen/Qwen2-VL-2B-Instruct \
+    --num_train_epochs 2 \
+    --run_name walkstream-grpo
+
+Environment variables:
+  MODEL_NAME_OR_PATH   default: Qwen/Qwen2-VL-2B-Instruct
+  OUTPUT_DIR           default: ../checkpoint/grpo_model
+  DATASET_PATH         default: ../../wad_dataset
+  RUN_NAME             default: walkstream-grpo-query-gene
+  NUM_TRAIN_EPOCHS     default: 2
+  ACCELERATE_CONFIG    default: configs/zero2.yaml
+  DEBUG_MODE           default: true
+  LOG_PATH             default: ./debug_log_2b_0307_think.txt
+  CUDA_VISIBLE_DEVICES default: 0,1,2,3,4,5,6,7
+  MAIN_PROCESS_PORT    default: 8080
+
+Notes:
+  - Full training expects Linux + CUDA + DeepSpeed.
+  - Any extra CLI flags are forwarded to src/open_r1/grpo_query_gene.py.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    print_help
+    exit 0
+fi
+
+if ! command -v accelerate >/dev/null 2>&1; then
+    echo "未找到 accelerate，请先执行 'pip install -e .' 或单独安装 accelerate。" >&2
+    exit 1
+fi
+
+if ! python -c "import deepspeed" >/dev/null 2>&1; then
+    echo "未检测到 deepspeed。完整训练前请先安装 DeepSpeed，并优先在 Linux + CUDA 环境下运行。" >&2
+    exit 1
+fi
+
 export DEBUG_MODE="${DEBUG_MODE:-true}"
 export LOG_PATH="${LOG_PATH:-./debug_log_2b_0307_think.txt}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"

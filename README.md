@@ -11,6 +11,45 @@
 | 📄 2025.08 | **[WalkVLM-LR](./WalkVLM-LR/)** | Legacy research snapshot with EAD and human-preference rewards. Kept for reference, but no longer the recommended reproducibility path. |
 | 🆕 2026.01 | **[WalkStream](./WalkStream/)** | Data & reward-enhanced low-latency VLM. 98k WRD clips, GRPO-based reward inference, decoupled async architecture — **52.6% latency reduction**. *(IJCV submitted)* |
 
+## ✅ Reproducibility at a glance
+
+| Component | Status | Recommended for a fresh checkout? | Entry |
+|---|---|---|---|
+| **WalkStream** | Maintained path | **Yes** | [`WalkStream/README.md`](./WalkStream/README.md) |
+| **WAD dataset** | Public download script | **Yes** | [`wad_dataset/README.md`](./wad_dataset/README.md) |
+| **WRD dataset** | Public download script | **Yes** | [`WalkStream/src/wrd_dataset/README.md`](./WalkStream/src/wrd_dataset/README.md) |
+| **WalkVLM-LR** | Archived research snapshot | No | [`WalkVLM-LR/README.md`](./WalkVLM-LR/README.md) |
+
+## 🚀 Recommended quickstart
+
+If you are new to this repository, start from the maintained `WalkStream` path instead of the archived `WalkVLM-LR` files.
+
+```bash
+# Clone and enter the repository
+git clone git@github.com:xiaoyuan1996/walkvlm.git
+cd walkvlm
+
+# Create an isolated Python environment
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+
+# Install the maintained WalkStream stack
+cd WalkStream/src/reminder_generation
+pip install -e .
+
+# Basic smoke tests for the supported entrypoints
+cd ../otp
+python train.py --help
+python inference.py --help
+python test.py --help
+```
+
+For a complete walkthrough, including data download and training commands, continue with [`WalkStream/README.md`](./WalkStream/README.md).
+
+> [!NOTE]
+> Full GRPO training in `WalkStream/src/reminder_generation` is intended for **Linux + NVIDIA GPU + CUDA + DeepSpeed**. macOS / Windows can still inspect the code and run lightweight CLI checks, but are not the primary training target.
+
 ##  🚀 Introduction
 
 Approximately **200 million individuals worldwide** suffer from varying degrees of visual impairment, making it crucial to leverage AI technology to provide **walking assistance**.
@@ -29,10 +68,8 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
 
 ---
 
-<!-- Approximately 200 million individuals around the world suffer from varying degrees of visual impairment, making it crucial to leverage AI technology to offer walking assistance for these people. With the recent progress of vision-language models (VLMs), applying VLMs to offer walking guidance has become popular. However, the existing methods of walking guidance are mainly based on self-curated question-answering datasets that are not publicly accessible, without a standardized benchmark for training or evaluation. Moreover, walking assistance often requires real-time streaming video analysis and the generation of concise yet informative reminders, making VLMs struggle due to excessive responses and low efficiency in inferences. In this paper, we introduce the first large-scale dataset dedicated to walking assistance, comprising 12,000 video-annotation pairs, to provide a unified benchmark for training and evaluating systems to help visually-impaired individuals walk. Furthermore, a WalkVLM model is proposed, which employs chain of thought for hierarchical planning to generate concise but informative reminders and utilizes temporal-aware adaptive prediction to reduce the temporal redundancy of reminders. Finally, we have established a solid benchmark for blind walking task and verified the advantages of WalkVLM in stream video processing for this task compared to other VLMs. -->
 ## 🛰️ Method & Dataset
 
-<!-- Figure 1 -->
 <div align="center">
   <img src="figures/img1.png" alt="Visualization results of the WAD dataset by region" width="85%">
   <div style="width:85%; text-align:justify; margin-top:6px;">
@@ -40,7 +77,6 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
   </div>
 </div>
 
-<!-- Figure 2 -->
 <div align="center">
   <img src="figures/img2.png" alt="Overview of the proposed WalkVLM framework" width="85%">
   <div style="width:85%; text-align:justify; margin-top:6px;">
@@ -48,13 +84,11 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
   </div>
 </div>
 
-
-
 ## 📂 Code structure
 
-```
+```text
 .
-├── wad_dataset               # Dataset used in WalkVLM
+├── wad_dataset               # Public WAD dataset helper scripts and extracted data
 ├── WalkVLM-LR                # Legacy research snapshot (archived entrypoints)
 │   ├── checkpoint            # Pretrained weights for archived LR experiments
 │   ├── vlm_grpo_template     # Archived GRPO template (kept for reference)
@@ -62,18 +96,19 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
 │   ├── inference.py          # Archived inference wrapper
 │   ├── test.py               # Archived evaluation wrapper
 │   └── train_EAD.py          # Legacy EAD training artifact
-└── WalkStream                # 🆕 Latest: reward-enhanced low-latency VLM (IJCV submission)
+└── WalkStream                # Maintained low-latency pipeline
     └── src/
+        ├── checkpoint/       # Optional pretrained checkpoint download helper
+        ├── infer/            # GPTScore helper
         ├── otp/              # Online Triggered Prediction module
-        ├── reminder_generation/  # GRPO-based reminder generation
-        ├── infer/            # Evaluation tools (GPTScore)
-        ├── wrd_dataset/      # Walking Reminder Dataset (98k clips)
-        └── checkpoint/       # Pre-trained model weights
+        ├── reminder_generation/  # Maintained GRPO training path
+        └── wrd_dataset/      # WRD dataset download helper
 ```
 
 ## 📖 Citation
-If you feel this code helpful or use this code or dataset, please cite it as
-```
+
+If you find this repository useful, please cite:
+
+```text
 Z. Yuan et al., "WalkVLM: Aid Visually Impaired People Walking by Vision Language Model," arXiv preprint arXiv:2412.20903, Dec. 30, 2024.
 ```
-    

@@ -65,8 +65,16 @@ _deps = [
     "trl==0.14.0",
     "vllm==0.6.6.post1",
     "wandb>=0.19.1",
+    "nltk",
+    "openai",
+    "opencv-python",
     "pillow",
+    "qwen-vl-utils",
+    "requests",
+    "rouge-score",
+    "scikit-learn",
     "timm",
+    "tqdm",
 ]
 
 # this is a lookup table with items like:
@@ -104,6 +112,15 @@ install_requires = [
     deps["sentencepiece"],
     deps["transformers"],
     deps["trl"],
+    deps["nltk"],
+    deps["openai"],
+    deps["opencv-python"],
+    deps["pillow"],
+    deps["qwen-vl-utils"],
+    deps["requests"],
+    deps["rouge-score"],
+    deps["scikit-learn"],
+    deps["tqdm"],
 ]
 
 setup(

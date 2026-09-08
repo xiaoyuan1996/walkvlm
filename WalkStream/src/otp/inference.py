@@ -4,9 +4,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
-from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+try:
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    Image = None
+
+try:
+    from qwen_vl_utils import process_vision_info
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    process_vision_info = None
+
+try:
+    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    AutoProcessor = None
+    Qwen2VLForConditionalGeneration = None
 
 from otp_model import VisionDangerClassification
 
@@ -20,6 +33,15 @@ DEFAULT_USER_MESSAGE = (
     "4. Include action suggestions (e.g., avoid, move forward, turn left). "
     "5. Prioritize safety and clarity."
 )
+
+
+def require_runtime_dependency(module_name, imported_symbol, install_name=None):
+    if imported_symbol is None:
+        package_name = install_name or module_name
+        raise ModuleNotFoundError(
+            f"Missing optional dependency '{package_name}'. Install it before running inference."
+        )
+    return imported_symbol
 
 
 def convert_ndarray_to_list(obj):
@@ -37,7 +59,8 @@ def remove_module_prefix(state_dict):
 
 
 def preprocess_image(image_path):
-    image = Image.open(image_path).convert("RGB")
+    image_module = require_runtime_dependency("Pillow", Image, "pillow")
+    image = image_module.open(image_path).convert("RGB")
     target_size = (544, 960)
     if image.size[0] > image.size[1]:
         image = image.rotate(90, expand=True)
@@ -45,10 +68,14 @@ def preprocess_image(image_path):
 
 
 def load_generator(model_name_or_path, device):
-    model = Qwen2VLForConditionalGeneration.from_pretrained(model_name_or_path, torch_dtype="auto")
+    generator_cls = require_runtime_dependency(
+        "transformers", Qwen2VLForConditionalGeneration, "transformers"
+    )
+    processor_cls = require_runtime_dependency("transformers", AutoProcessor, "transformers")
+    model = generator_cls.from_pretrained(model_name_or_path, torch_dtype="auto")
     model = model.to(device)
     model.eval()
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    processor = processor_cls.from_pretrained(model_name_or_path)
     return model, processor
 
 
@@ -72,6 +99,7 @@ def load_classifier(classifier_checkpoint, device):
 
 
 def generate_text_from_image(image_path, user_message, model, processor, device, max_new_tokens):
+    process_vision = require_runtime_dependency("qwen_vl_utils", process_vision_info, "qwen-vl-utils")
     image_path = str(Path(image_path).expanduser().resolve())
     if not Path(image_path).exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -86,7 +114,7 @@ def generate_text_from_image(image_path, user_message, model, processor, device,
         }
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, video_inputs = process_vision(messages)
     inputs = processor(
         text=[text],
         images=image_inputs,
@@ -120,7 +148,7 @@ def extract_visual_feature(image_path, model, processor, device):
         }
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, video_inputs = process_vision(messages)
     inputs = processor(
         text=[text],
         images=image_inputs,

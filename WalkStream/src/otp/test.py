@@ -5,20 +5,54 @@ import sys
 from pathlib import Path
 
 import torch
-from nltk.util import ngrams
-from PIL import Image
-from qwen_vl_utils import process_vision_info
-from rouge_score import rouge_scorer
-from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
-from transformers import AutoProcessor, CLIPModel, CLIPProcessor, Qwen2VLForConditionalGeneration
+
+try:
+    from nltk.util import ngrams
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    ngrams = None
+
+try:
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    Image = None
+
+try:
+    from qwen_vl_utils import process_vision_info
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    process_vision_info = None
+
+try:
+    from rouge_score import rouge_scorer
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    rouge_scorer = None
+
+try:
+    from sklearn.metrics.pairwise import cosine_similarity
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    cosine_similarity = None
+
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    tqdm = None
+
+try:
+    from transformers import AutoProcessor, CLIPModel, CLIPProcessor, Qwen2VLForConditionalGeneration
+except ModuleNotFoundError:  # pragma: no cover - allows `--help` without full runtime deps
+    AutoProcessor = None
+    CLIPModel = None
+    CLIPProcessor = None
+    Qwen2VLForConditionalGeneration = None
 
 CURRENT_DIR = Path(__file__).resolve().parent
 INFER_DIR = CURRENT_DIR.parent / "infer"
 if str(INFER_DIR) not in sys.path:
     sys.path.append(str(INFER_DIR))
 
-from GPTScore import evaluate_image  # noqa: E402
+try:
+    from GPTScore import evaluate_image  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - optional GPT scoring
+    evaluate_image = None
 
 
 DEFAULT_USER_MESSAGE = (
@@ -33,6 +67,15 @@ EN_STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "into", "is", "it",
     "of", "on", "or", "the", "to", "with", "this", "that", "there", "here", "near", "ahead",
 }
+
+
+def require_runtime_dependency(module_name, imported_symbol, install_name=None):
+    if imported_symbol is None:
+        package_name = install_name or module_name
+        raise ModuleNotFoundError(
+            f"Missing optional dependency '{package_name}'. Install it before running evaluation."
+        )
+    return imported_symbol
 
 
 def load_annotation_records(annotation_path: Path):
@@ -135,16 +178,22 @@ def resolve_image_path(frame_path: str, dataset_root: Path, image_root: Path | N
 
 
 def load_generation_model(model_name_or_path, device):
-    model = Qwen2VLForConditionalGeneration.from_pretrained(model_name_or_path, torch_dtype="auto")
+    generator_cls = require_runtime_dependency(
+        "transformers", Qwen2VLForConditionalGeneration, "transformers"
+    )
+    processor_cls = require_runtime_dependency("transformers", AutoProcessor, "transformers")
+    model = generator_cls.from_pretrained(model_name_or_path, torch_dtype="auto")
     model = model.to(device)
     model.eval()
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    processor = processor_cls.from_pretrained(model_name_or_path)
     return model, processor
 
 
 def load_clip_model(model_name_or_path, device):
-    processor = CLIPProcessor.from_pretrained(model_name_or_path)
-    model = CLIPModel.from_pretrained(model_name_or_path).to(device)
+    clip_processor_cls = require_runtime_dependency("transformers", CLIPProcessor, "transformers")
+    clip_model_cls = require_runtime_dependency("transformers", CLIPModel, "transformers")
+    processor = clip_processor_cls.from_pretrained(model_name_or_path)
+    model = clip_model_cls.from_pretrained(model_name_or_path).to(device)
     model.eval()
     return model, processor
 
@@ -156,11 +205,13 @@ def encode_text_with_clip(text, model, processor, device):
 
 
 def generate_ngrams(text, n=2):
+    ngram_builder = require_runtime_dependency("nltk", ngrams, "nltk")
     words = text.split()
-    return [" ".join(gram) for gram in ngrams(words, n)]
+    return [" ".join(gram) for gram in ngram_builder(words, n)]
 
 
 def calculate_keyword_density(text, keywords, model, processor, device, threshold=0.9):
+    similarity_fn = require_runtime_dependency("scikit-learn", cosine_similarity, "scikit-learn")
     if not keywords:
         return 0.0
     text = re.sub(r"[^\w\s]", "", text.lower())
@@ -177,7 +228,7 @@ def calculate_keyword_density(text, keywords, model, processor, device, threshol
     for token in all_tokens:
         token_embedding = encode_text_with_clip(token, model, processor, device)
         for keyword_embedding in keyword_embeddings:
-            similarity = cosine_similarity(token_embedding.cpu().numpy(), keyword_embedding.cpu().numpy())[0][0]
+            similarity = similarity_fn(token_embedding.cpu().numpy(), keyword_embedding.cpu().numpy())[0][0]
             if similarity >= threshold:
                 keyword_count += 1
                 break
@@ -185,6 +236,7 @@ def calculate_keyword_density(text, keywords, model, processor, device, threshol
 
 
 def generate_text_from_image(image_path, user_message, model, processor, device, max_new_tokens):
+    process_vision = require_runtime_dependency("qwen_vl_utils", process_vision_info, "qwen-vl-utils")
     messages = [
         {
             "role": "user",
@@ -195,7 +247,7 @@ def generate_text_from_image(image_path, user_message, model, processor, device,
         }
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, video_inputs = process_vision(messages)
     inputs = processor(
         text=[text],
         images=image_inputs,
@@ -220,7 +272,8 @@ def generate_text_from_image(image_path, user_message, model, processor, device,
 def maybe_compute_gpt_score(args, qwen_text, generated_text):
     if not (args.gpt_appid and args.gpt_appkey and args.gpt_source and qwen_text):
         return None
-    return evaluate_image(args.gpt_appid, args.gpt_appkey, args.gpt_source, qwen_text, generated_text)
+    score_fn = require_runtime_dependency("GPTScore", evaluate_image, "openai")
+    return score_fn(args.gpt_appid, args.gpt_appkey, args.gpt_source, qwen_text, generated_text)
 
 
 def run_evaluation(args):
@@ -232,20 +285,22 @@ def run_evaluation(args):
     image_root = Path(args.image_root).expanduser().resolve() if args.image_root else None
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
+    progress = require_runtime_dependency("tqdm", tqdm, "tqdm")
+    scorer_factory = require_runtime_dependency("rouge-score", rouge_scorer, "rouge-score")
     generation_model, processor = load_generation_model(args.model_name_or_path, device)
     clip_model, clip_processor = load_clip_model(args.clip_model_name_or_path, device)
     records = load_annotation_records(annotation_path)
     if args.max_samples:
         records = records[: args.max_samples]
 
-    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+    scorer = scorer_factory.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
     processed = 0
     total_rouge1 = total_rouge2 = total_rougel = 0.0
     total_keyword_density = total_gpt_score = 0.0
     gpt_score_count = 0
     results = []
 
-    for example in tqdm(records, desc="Evaluating", ncols=100):
+    for example in progress(records, desc="Evaluating", ncols=100):
         reference = extract_reference(example)
         frame_path = example.get("frame_path")
         if reference is None or frame_path is None:

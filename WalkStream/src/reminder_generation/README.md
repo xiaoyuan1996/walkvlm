@@ -1,6 +1,12 @@
 # WalkStream Reminder Generation
 
-`src/reminder_generation` 是 WalkStream 的提醒生成训练模块，基于 GRPO 对导航提醒进行优化。
+`src/reminder_generation` 是 WalkStream 当前**维护中的提醒生成训练入口**，基于 GRPO 对导航提醒进行优化。
+
+## 适用范围
+
+- **推荐用途**：WalkStream 的提醒生成训练与实验复现
+- **推荐环境**：Linux + NVIDIA GPU + CUDA + DeepSpeed
+- **不再推荐**：旧版 `WalkVLM-LR` 模板脚本和历史副本脚本
 
 ## 功能说明
 
@@ -12,16 +18,48 @@
 ## 安装
 
 ```bash
-cd src/reminder_generation
+cd WalkStream/src/reminder_generation
 pip install -e .
 ```
+
+如果你还没有创建虚拟环境，建议先在仓库根目录执行：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+```
+
+## 最小 smoke test
+
+安装完成后，先确认训练入口脚本本身可见：
+
+```bash
+cd WalkStream/src/reminder_generation
+bash run_grpo_query_gene.sh --help
+```
+
+如果你能看到帮助信息或参数说明，说明包装脚本已经能被正确解析。
+
+## 数据输入约定
+
+训练样本至少应满足以下条件：
+
+- 标注文件中存在 `frame_path`
+- 标注文件中存在 `reminder` 或兼容字段（如旧数据中的 `alter`）
+- 对应关键帧目录下能找到 `8.jpg` / `8.jpeg` / `8.png` 这类图片
+
+`--dataset_path` 可以是两种形式：
+
+- **数据集根目录**：脚本会自动尝试查找训练 / 验证标注与图片目录
+- **标注文件路径**：脚本会以该文件为主，并结合 `--image_root` / `--eval_image_root` 解析图片
 
 ## 训练
 
 最常用的启动方式如下：
 
 ```bash
-cd src/reminder_generation
+cd WalkStream/src/reminder_generation
 bash run_grpo_query_gene.sh \
   --dataset_path ../../wad_dataset \
   --output_dir ../checkpoint/grpo_model \
@@ -39,9 +77,20 @@ bash run_grpo_query_gene.sh \
 - `--cache_filename`：每个样本旁的 cache 文件名，默认 `cache_qwen2vl.pt`。
 - `--disable_cache`：禁用 cache 文件读取，统一回退到随机 cache。
 
+## 环境变量
+
+如果你希望复用本地缓存好的奖励模型，可设置：
+
+```bash
+export WALKSTREAM_GPT2_MODEL=/path/to/gpt2
+export WALKSTREAM_CLIP_MODEL=/path/to/clip-vit-base-patch16
+```
+
+如果不设置，脚本会回退到公开可下载模型。
+
 ## 兼容性说明
 
-以下旧参数**并不被训练入口使用**，不要再写进命令里：
+以下旧参数**并不被当前训练入口使用**，不要再写进命令里：
 
 - `--sft_data_ratio`
 - `--grpo_data_ratio`

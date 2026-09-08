@@ -8,3 +8,4 @@ vlm_grpo_template/wandb/*
 **/.DS_Store
 **/__pycache__/
 .DS_Store
+.DS_Store
