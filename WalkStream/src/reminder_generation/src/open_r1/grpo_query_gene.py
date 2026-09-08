@@ -16,7 +16,9 @@ import os
 import re
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional
 import cv2
 import numpy as np
 import math
@@ -50,8 +52,8 @@ class GRPOScriptArguments(ScriptArguments):
             List of reward functions. Possible values: 'accuracy', 'format'.
     """
     reward_funcs: list[str] = field(
-        default_factory=lambda: ['fluency', 'simplicity', 'sematic','keywords'],
-        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
+        default_factory=lambda: ['fluency', 'simplicity', 'sematic', 'keywords'],
+        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'."},
     )
     max_pixels: Optional[int] = field(
         default=12845056,
@@ -70,13 +72,33 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Whether to freeze the vision model parameters during training"},
     )
     dataset_prefix: str = field(
-        default="/mnt/default",
-        metadata={"help": "Base directory path for the dataset."}
+        default="",
+        metadata={"help": "Optional prefix prepended to relative dataset and image paths for backward compatibility."}
     )
     dataset_path: str = field(
-        default="/mnt/default.json",
-        metadata={"help": "Full path to the dataset file."}
-    )        
+        default=".",
+        metadata={"help": "Path to the dataset root directory or the training annotation file."}
+    )
+    dataset_val_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to the evaluation annotation file. If omitted, the script will try to auto-detect one."}
+    )
+    image_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional directory that contains frame folders referenced by frame_path for training."}
+    )
+    eval_image_root: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional directory that contains evaluation frame folders. Defaults to image_root when omitted."}
+    )
+    cache_filename: str = field(
+        default="cache_qwen2vl.pt",
+        metadata={"help": "Name of the per-frame cache file stored alongside each key frame."}
+    )
+    disable_cache: bool = field(
+        default=False,
+        metadata={"help": "Disable loading per-frame cache files and fall back to random cache tensors."}
+    )
 
 def extract_letters(text): # for RAVEN
     pattern = r'(^|\s|\[|\()([A-H])(\s|\]|\)|$)'
@@ -166,11 +188,13 @@ def mean_token_accuracy_reward(completions, solution, **kwargs):
     return rewards
 
 
+@lru_cache(maxsize=1)
 def load_gpt2_model():
     """
-    加载预训练的 GPT-2 模型和分词器
+    加载预训练的 GPT-2 模型和分词器。
+    优先读取 `WALKSTREAM_GPT2_MODEL`，未设置时回退到 Hugging Face 默认 `gpt2`。
     """
-    model_path = '/mnt/gemininjceph2/geminicephfs/wx-mm-spr-xxxx/lichongyang/code/walkvlm/gpt2/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e'
+    model_path = os.getenv("WALKSTREAM_GPT2_MODEL", "gpt2")
     model = GPT2LMHeadModel.from_pretrained(model_path)
     tokenizer = GPT2Tokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
@@ -257,16 +281,16 @@ def fluency_reward(completions, **kwargs):
     return rewards
 
 
+@lru_cache(maxsize=1)
 def load_clip_model():
     """
     Load the pre-trained CLIP model and processor for encoding text.
+    优先读取 `WALKSTREAM_CLIP_MODEL`，未设置时回退到公开模型 `openai/clip-vit-base-patch16`。
     """
-    model_path = "/mnt/gemininjceph2/geminicephfs/wx-mm-spr-xxxx/lichongyang/code/walkvlm/clip/models--openai--clip-vit-base-patch16/snapshots/57c216476eefef5ab752ec549e440a49ae4ae5f3"
+    model_path = os.getenv("WALKSTREAM_CLIP_MODEL", "openai/clip-vit-base-patch16")
     processor = CLIPProcessor.from_pretrained(model_path)
     model = CLIPModel.from_pretrained(model_path)
     return model, processor
-
-clip_model, clip_processor = load_clip_model()
 
 def encode_text_with_clip(text, model, processor):
     """
@@ -290,10 +314,8 @@ def semantic_similarity_reward(completions, solution, **kwargs):
         contents = [completion[0]["content"] for completion in completions]
 
     rewards = []
-    
-    # Load CLIP model and processor
-    # model, processor = load_clip_model()
-    
+    clip_model, clip_processor = load_clip_model()
+
     for content, sol in zip(contents, solution):
         # semantic_similarity
         # Encode both the content and the solution using CLIP
@@ -416,7 +438,8 @@ def keywords_reward(completions, solution, **kwargs):
         contents = [completion[0]["content"] for completion in completions]
     
     rewards = []
-    
+    clip_model, clip_processor = load_clip_model()
+
     for completion in contents:
         # 先将句子进行分词，并去除重复的词
         # print("Keywords:", keywords)
@@ -673,173 +696,328 @@ def load_cache_from_pt(pt_path, device="cpu", dtype=torch.float32):
 
 
 
+DEFAULT_USER_MESSAGE = (
+    "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. "
+    "The prompt should: 1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles). "
+    "2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock). "
+    "3. Provide specific details about objects (e.g., shape, size, material, distance). "
+    "4. Include action suggestions (e.g., avoid, move forward, turn left). "
+    "5. Prioritize safety and clarity. Output Prompt:"
+)
+
+TRAIN_ANNOTATION_PATTERNS = (
+    "train*.jsonl",
+    "train*.json",
+    "*train*.jsonl",
+    "*train*.json",
+)
+EVAL_ANNOTATION_PATTERNS = (
+    "test*.jsonl",
+    "test*.json",
+    "val*.jsonl",
+    "val*.json",
+    "eval*.jsonl",
+    "eval*.json",
+    "*test*.jsonl",
+    "*test*.json",
+    "*val*.jsonl",
+    "*val*.json",
+    "*eval*.jsonl",
+    "*eval*.json",
+)
+EN_STOPWORDS = {
+    "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "into", "is", "it",
+    "of", "on", "or", "the", "to", "with", "this", "that", "there", "here", "near", "ahead",
+}
+
+
+def _unique_items(items):
+    unique_items = []
+    seen = set()
+    for item in items:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            unique_items.append(text)
+    return unique_items
+
+
+def _resolve_user_path(path_str: Optional[str], prefix: str = "") -> Optional[Path]:
+    if not path_str:
+        return None
+    path = Path(path_str).expanduser()
+    if not path.is_absolute() and prefix:
+        prefixed = Path(prefix).expanduser() / path
+        if prefixed.exists():
+            path = prefixed
+    return path
+
+
+def _find_annotation_file(root: Path, patterns: tuple[str, ...], exclude: Optional[Path] = None) -> Optional[Path]:
+    excluded = exclude.resolve() if exclude and exclude.exists() else None
+    for pattern in patterns:
+        for candidate in sorted(root.rglob(pattern)):
+            if not candidate.is_file():
+                continue
+            if excluded and candidate.resolve() == excluded:
+                continue
+            return candidate
+    return None
+
+
+def _resolve_image_root(explicit_root: Optional[str], dataset_root: Path, dataset_prefix: str = "", prefer_eval: bool = False) -> Path:
+    explicit_path = _resolve_user_path(explicit_root, dataset_prefix)
+    if explicit_path and explicit_path.exists():
+        return explicit_path
+
+    preferred_names = ["test_data4", "test_data", "src_data4", "src_data", "keyframes", "frames", "images"]
+    if not prefer_eval:
+        preferred_names = ["src_data4", "src_data", "keyframes", "frames", "images", "test_data4", "test_data"]
+
+    candidates = [dataset_root, dataset_root.parent]
+    for base in (dataset_root, dataset_root.parent):
+        for name in preferred_names:
+            candidates.append(base / name)
+            candidates.append(base / "wad_dataset" / name)
+            candidates.append(base / "WRD" / name)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return dataset_root
+
+
+def _resolve_image_path(frame_path: str, image_root: Path, dataset_root: Path) -> Optional[Path]:
+    frame_rel = Path(str(frame_path).strip("/"))
+    candidate_bases = _unique_items([
+        image_root,
+        dataset_root,
+        dataset_root.parent,
+        image_root.parent if image_root != image_root.parent else image_root,
+    ])
+
+    for base in candidate_bases:
+        base = Path(base)
+        for suffix in (frame_rel / "8.jpg", frame_rel / "8.jpeg", frame_rel / "8.png"):
+            candidate = base / suffix
+            if candidate.exists():
+                return candidate
+
+    frame_pattern = frame_rel.as_posix().rstrip("/")
+    for base in candidate_bases:
+        base = Path(base)
+        if not base.exists():
+            continue
+        for ext in ("jpg", "jpeg", "png"):
+            matches = sorted(base.glob(f"**/{frame_pattern}/8.{ext}"))
+            if matches:
+                return matches[0]
+    return None
+
+
+def _load_annotation_records(annotation_path: Path) -> list[dict[str, Any]]:
+    import json
+
+    with open(annotation_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            f.seek(0)
+            return [json.loads(line) for line in f if line.strip()]
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "items", "annotations", "samples", "train", "test"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    raise ValueError(f"Unsupported annotation format: {annotation_path}")
+
+
+def _normalize_keywords(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        tokens = []
+        for item in value:
+            tokens.extend(_normalize_keywords(item))
+        return _unique_items(tokens)
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    split_tokens = _unique_items(re.split(r"[#;,，；、/|\n\t]+", text))
+    if len(split_tokens) > 1:
+        return split_tokens[:12]
+
+    zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    en_tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", text)
+        if len(token) > 2 and token.lower() not in EN_STOPWORDS
+    ]
+    tokens = _unique_items(zh_tokens + en_tokens)
+    return tokens[:12] if tokens else [text]
+
+
+def _extract_keywords(example: dict[str, Any]) -> list[str]:
+    for key in ("keywords", "keyword", "tags", "tag"):
+        keywords = _normalize_keywords(example.get(key))
+        if keywords:
+            return keywords
+
+    for key in ("reminder", "alter", "answer", "caption", "query"):
+        text = example.get(key)
+        keywords = _normalize_keywords(text)
+        if keywords:
+            return keywords
+    return []
+
+
+def _extract_reminder_text(example: dict[str, Any]) -> Optional[str]:
+    for key in ("reminder", "alter", "answer", "caption"):
+        value = example.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _load_cache_for_image(image_path: Path, cache_filename: str, disable_cache: bool):
+    if not disable_cache:
+        cache_path = image_path.parent / cache_filename
+        if cache_path.exists():
+            try:
+                return load_cache_from_pt(str(cache_path))
+            except Exception as exc:
+                print(f"Failed to load cache from {cache_path}: {exc}. Falling back to random cache.")
+    return _make_random_cache(CACHE_TOKENS, CACHE_DIM)
+
+
+def _make_conversation(example: dict[str, Any], image_root: Path, dataset_root: Path, script_args: GRPOScriptArguments):
+    reminder_text = _extract_reminder_text(example)
+    frame_path = example.get("frame_path")
+    if reminder_text is None or frame_path is None:
+        return None
+
+    image_path = _resolve_image_path(str(frame_path), image_root, dataset_root)
+    if image_path is None:
+        return None
+
+    keywords = _extract_keywords(example)
+    cache_embeds = _load_cache_for_image(image_path, script_args.cache_filename, script_args.disable_cache)
+    with Image.open(image_path).convert("RGB") as pil_image:
+        image = pil_image.copy()
+
+    return {
+        "image": image,
+        "image_path": str(image_path),
+        "cache_embeds": cache_embeds,
+        "prompt": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "keywords": keywords},
+                    {"type": "text", "text": DEFAULT_USER_MESSAGE},
+                ],
+            },
+        ],
+        "solution": f"<answer>{reminder_text}</answer>",
+    }
+
+
+def _resolve_dataset_layout(script_args: GRPOScriptArguments):
+    dataset_path = _resolve_user_path(script_args.dataset_path, script_args.dataset_prefix)
+    if dataset_path is None:
+        raise ValueError("dataset_path is required.")
+
+    eval_dataset_path = _resolve_user_path(script_args.dataset_val_path, script_args.dataset_prefix)
+    if dataset_path.is_dir():
+        dataset_root = dataset_path
+        train_annotation = _find_annotation_file(dataset_root, TRAIN_ANNOTATION_PATTERNS)
+        eval_annotation = eval_dataset_path or _find_annotation_file(dataset_root, EVAL_ANNOTATION_PATTERNS)
+    else:
+        dataset_root = dataset_path.parent
+        train_annotation = dataset_path
+        eval_annotation = eval_dataset_path or _find_annotation_file(dataset_root, EVAL_ANNOTATION_PATTERNS, exclude=train_annotation)
+
+    if train_annotation is None or not train_annotation.exists():
+        raise FileNotFoundError(
+            f"Could not locate a training annotation file from dataset_path={script_args.dataset_path}."
+        )
+
+    train_image_root = _resolve_image_root(script_args.image_root, dataset_root, script_args.dataset_prefix, prefer_eval=False)
+    eval_image_root = _resolve_image_root(script_args.eval_image_root or script_args.image_root, dataset_root, script_args.dataset_prefix, prefer_eval=True)
+    return dataset_root, train_annotation, eval_annotation, train_image_root, eval_image_root
+
+
+def _build_dataset(records: list[dict[str, Any]], image_root: Path, dataset_root: Path, script_args: GRPOScriptArguments):
+    dataset = []
+    for sample in records:
+        conversation = _make_conversation(sample, image_root, dataset_root, script_args)
+        if conversation is not None:
+            dataset.append(conversation)
+    return dataset
+
+
 reward_funcs_registry = {
     "accuracy": accuracy_reward,
     "format": format_reward,
     "length": length_reward,
-    'include_tags': include_tags_reward,
-    'simplicity': simplicity_reward,
-    'sematic': semantic_similarity_reward,
-    'keywords': keywords_reward,
-    'fluency': fluency_reward
+    "include_tags": include_tags_reward,
+    "simplicity": simplicity_reward,
+    "sematic": semantic_similarity_reward,
+    "keywords": keywords_reward,
+    "fluency": fluency_reward,
 }
 
+
 def main(script_args, training_args, model_args):
-    # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
 
-    
-    # QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (option) in <answer> </answer> tags."
-    
-    def make_conversation_sat(example):
-        if 'reminder' not in example:
-            return None
-        image_path = dataset_prefix + jpg_path + example["frame_path"] + "/8.jpg"
-        if not os.path.exists(image_path):
-    
-            return None
-        assistant_message = f"Alter: {example['reminder']}."
-        keywords = example['keywords']
-        with Image.open(image_path).convert('RGB') as image:
-            image = Image.open(image_path)
-        # question = example["question"]
-        # prompt = f'A conversation between User and Assistant. The user asks a question about the image, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\nUser: {question} \nAssistant: Let me solve this step by step.\n<think>'
+    dataset_root, train_annotation, eval_annotation, train_image_root, eval_image_root = _resolve_dataset_layout(script_args)
+    print(f"Training annotations: {train_annotation}")
+    print(f"Evaluation annotations: {eval_annotation}")
+    print(f"Training image root: {train_image_root}")
+    print(f"Evaluation image root: {eval_image_root}")
 
-        # QUESTION_TEMPLATE = "{Question} \n 使用 <think> </think> 这样的格式输出思考过程，并使用  <answer> </answer> 来输出最终结果，输出示例： <think> 可能包含「keyword1」和「keyword2」的标签，原因是... </think>  <answer> #keyword1#keyword2 </answer>。 \n 这张"
-        
-        pt_path = dataset_prefix + jpg_path + example["frame_path"] + "/cache_qwen2vl.pt"
-        cache_embeds = load_cache_from_pt(pt_path) 
-        # cache_embeds = _make_random_cache(CACHE_TOKENS, CACHE_DIM) 
-        QUESTION_TEMPLATE = "给这张图片打出中文标签。 \n 使用 <think> </think> 这样的格式输出思考过程，并使用  <answer> </answer> 来输出最终结果，输出示例： <think> 可能包含「keyword1」和「keyword2」的标签，原因是... </think>  <answer> #keyword1#keyword2 </answer>。 \n 这张图像的思考过程和标签为: <think> "
-        user_message = "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. The prompt should:1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles).2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock).3. Provide specific details about objects (e.g., shape, size, material, distance).4. Include action suggestions (e.g., avoid, move forward, turn left).5. Prioritize safety and clarity. Output Prompt: "
-        
-        # return {"image": image,
-            # "prompt": [
-                        # {"type": "image"},
-                        # {"type": "text", "text": "<image>" + prompt}],
-            # "solution":  "<answer>" + example["solution"] + "</answer>", 
-        # }
-        #"image": image_path,
-        return {"image": image,
-                "image_path": image_path,
-                "cache_embeds": cache_embeds,
-                "prompt": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            # {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["question"])
-                            {"type": "text", "keywords": keywords},
-                            {"type": "text", "text": user_message},
-                        ],
-                    },
-                ],
-                "solution":  "<answer>" + example['reminder'] + "</answer>", 
-            } 
+    train_records = _load_annotation_records(train_annotation)
+    train_dataset = _build_dataset(train_records, train_image_root, dataset_root, script_args)
 
-    def make_conversation_sat_test(example):
-        if 'reminder' not in example:
-            return None
-        image_path = dataset_prefix + jpg_path_test + example["frame_path"] + "/8.jpg"
-        if not os.path.exists(image_path):
-    
-            return None
-        assistant_message = f"Alter: {example['reminder']}."
-        keywords = example['keywords']
-        with Image.open(image_path).convert('RGB') as image:
-            image = Image.open(image_path)
-        # question = example["question"]
-        # prompt = f'A conversation between User and Assistant. The user asks a question about the image, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\nUser: {question} \nAssistant: Let me solve this step by step.\n<think>'
+    eval_dataset = None
+    if training_args.eval_strategy != "no" and eval_annotation is not None:
+        eval_records = _load_annotation_records(eval_annotation)
+        eval_dataset = _build_dataset(eval_records, eval_image_root, dataset_root, script_args)
 
-        # QUESTION_TEMPLATE = "{Question} \n 使用 <think> </think> 这样的格式输出思考过程，并使用  <answer> </answer> 来输出最终结果，输出示例： <think> 可能包含「keyword1」和「keyword2」的标签，原因是... </think>  <answer> #keyword1#keyword2 </answer>。 \n 这张"
-
-        cache_embeds = _make_random_cache(CACHE_TOKENS, CACHE_DIM) 
-        QUESTION_TEMPLATE = "给这张图片打出中文标签。 \n 使用 <think> </think> 这样的格式输出思考过程，并使用  <answer> </answer> 来输出最终结果，输出示例： <think> 可能包含「keyword1」和「keyword2」的标签，原因是... </think>  <answer> #keyword1#keyword2 </answer>。 \n 这张图像的思考过程和标签为: <think> "
-        user_message = "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. The prompt should:1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles).2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock).3. Provide specific details about objects (e.g., shape, size, material, distance).4. Include action suggestions (e.g., avoid, move forward, turn left).5. Prioritize safety and clarity. Output Prompt: "
-        
-        # return {"image": image,
-            # "prompt": [
-                        # {"type": "image"},
-                        # {"type": "text", "text": "<image>" + prompt}],
-            # "solution":  "<answer>" + example["solution"] + "</answer>", 
-        # }
-        #"image": image_path,
-        return {"image": image,
-                "image_path": image_path,
-                "cache_embeds": cache_embeds,
-                "prompt": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            # {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["question"])
-                            {"type": "text", "keywords": keywords},
-                            {"type": "text", "text": user_message},
-                        ],
-                    },
-                ],
-                "solution":  "<answer>" + example['reminder'] + "</answer>", 
-            }       
-    
-    dataset_prefix = "/mnt/gemininjceph2/geminicephfs/wx-mm-spr-xxxx/lichongyang/data/"
-    jpg_path = "src_data4/"
-    jpg_path_test = "test_data4"
-    dataset_path = "train_v4_with_keywords.json"
-    dataset_path_val = "test_src_v4_withkeywords.json"
-
-    import json
-    # load json file 
-    # with open(os.path.join(script_args.dataset_prefix, script_args.dataset_path), 'r') as f:
-    #     sat_dataset = json.load(f)
-    with open(dataset_prefix + dataset_path, 'r') as f:
-            sat_dataset = [json.loads(line.strip()) for line in f]
-    dataset = []
-    for sample in sat_dataset:
-        conversation = make_conversation_sat(sample)
-        if conversation is not None:
-            dataset.append(conversation)
-
-        #构建val dataset
-    with open(dataset_prefix + dataset_path_val, 'r') as f:
-        # sat_dataset = json.load(f)
-        sat_dataset_val = [json.loads(line.strip()) for line in f]
-    # import pdb; pdb.set_trace()
-    # dataset = [make_conversation_sat(sample) for sample in sat_dataset]
-
-    dataset_val = []
-    for sample in sat_dataset_val:
-        conversation = make_conversation_sat_test(sample)
-        if conversation is not None:
-            dataset_val.append(conversation)
-
-    dataset = {'train': dataset, 'test':dataset_val}
-
+    dataset = {
+        "train": train_dataset,
+        "test": eval_dataset or [],
+    }
     trainer_cls = Qwen2VLGRPOTrainer
 
-    # Initialize the GRPO trainer
+    train_split = script_args.dataset_train_split if script_args.dataset_train_split in dataset else "train"
+    eval_split = script_args.dataset_test_split if script_args.dataset_test_split in dataset else "test"
+
     trainer = trainer_cls(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        # peft_config=get_peft_config(model_args),
+        train_dataset=dataset[train_split],
+        eval_dataset=dataset[eval_split] if training_args.eval_strategy != "no" else None,
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
     )
-    
+
     if script_args.freeze_vision:
         trainer.model.visual.requires_grad_ = False
     elif script_args.freeze_llm:
         trainer.model.model.requires_grad_ = False
-    # Train and push the model to the Hub
-    trainer.train()
 
-    # Save and push to hub
+    trainer.train()
     trainer.save_model(training_args.output_dir)
-    # if training_args.push_to_hub:
-        # trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
 
 if __name__ == "__main__":
@@ -848,6 +1026,5 @@ if __name__ == "__main__":
     print(script_args)
     print(training_args)
     print(model_args)
-    
+
     main(script_args, training_args, model_args)
-    

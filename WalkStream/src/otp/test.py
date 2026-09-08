@@ -1,164 +1,200 @@
+import argparse
 import json
-import os
-import torch
-import torch.distributed as dist
-from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, GPT2LMHeadModel, GPT2Tokenizer
-from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from rouge_score import rouge_scorer
-import numpy as np
-import math
-from collections import Counter
-from tqdm import tqdm  # 导入 tqdm 用于显示进度条
-from qwen_vl_utils import process_vision_info
-import requests
-import base64
-import time
-import hmac
-import hashlib
-import io
-from transformers import AutoConfig
-from GPTScore import evaluate_image  # 引入 GPT-4 打分函数
-from accelerate import Accelerator  # 导入accelerate
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import CLIPProcessor, CLIPModel
 import re
+import sys
+from pathlib import Path
+
+import torch
 from nltk.util import ngrams
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+from rouge_score import rouge_scorer
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+from transformers import AutoProcessor, CLIPModel, CLIPProcessor, Qwen2VLForConditionalGeneration
+
+CURRENT_DIR = Path(__file__).resolve().parent
+INFER_DIR = CURRENT_DIR.parent / "infer"
+if str(INFER_DIR) not in sys.path:
+    sys.path.append(str(INFER_DIR))
+
+from GPTScore import evaluate_image  # noqa: E402
 
 
-accelerator = Accelerator()
-appid = ""
-appkey = ""
-source = ""
+DEFAULT_USER_MESSAGE = (
+    "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. "
+    "The prompt should: 1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles). "
+    "2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock). "
+    "3. Provide specific details about objects (e.g., shape, size, material, distance). "
+    "4. Include action suggestions (e.g., avoid, move forward, turn left). "
+    "5. Prioritize safety and clarity. Output Prompt:"
+)
+EN_STOPWORDS = {
+    "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "into", "is", "it",
+    "of", "on", "or", "the", "to", "with", "this", "that", "there", "here", "near", "ahead",
+}
 
-# 加载 CLIP 模型和处理器
-def load_clip_model():
-    """
-    Load the pre-trained CLIP model and processor for encoding text.
-    """
-    model_path = ""
-    processor = CLIPProcessor.from_pretrained(model_path)
-    model = CLIPModel.from_pretrained(model_path)
+
+def load_annotation_records(annotation_path: Path):
+    with open(annotation_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            f.seek(0)
+            return [json.loads(line) for line in f if line.strip()]
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "items", "annotations", "samples", "test", "eval"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    raise ValueError(f"Unsupported annotation format: {annotation_path}")
+
+
+def unique_items(items):
+    results = []
+    seen = set()
+    for item in items:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            results.append(text)
+    return results
+
+
+def normalize_keywords(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        merged = []
+        for item in value:
+            merged.extend(normalize_keywords(item))
+        return unique_items(merged)
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    split_tokens = unique_items(re.split(r"[#;,，；、/|\n\t]+", text))
+    if len(split_tokens) > 1:
+        return split_tokens[:12]
+
+    zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    en_tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", text)
+        if len(token) > 2 and token.lower() not in EN_STOPWORDS
+    ]
+    tokens = unique_items(zh_tokens + en_tokens)
+    return tokens[:12] if tokens else [text]
+
+
+def extract_reference(example):
+    for key in ("reminder", "alter", "answer", "caption"):
+        value = example.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_keywords(example):
+    for key in ("keywords", "keyword", "tags", "tag"):
+        keywords = normalize_keywords(example.get(key))
+        if keywords:
+            return keywords
+    reference = extract_reference(example)
+    return normalize_keywords(reference)
+
+
+def resolve_image_path(frame_path: str, dataset_root: Path, image_root: Path | None):
+    frame_rel = Path(str(frame_path).strip("/"))
+    candidates = []
+    if image_root:
+        candidates.append(image_root)
+    candidates.extend(
+        [
+            dataset_root,
+            dataset_root / "src_data",
+            dataset_root / "src_data4",
+            dataset_root / "test_data",
+            dataset_root / "test_data4",
+            dataset_root / "keyframes",
+            dataset_root.parent / "wad_dataset" / "src_data",
+            dataset_root.parent / "wad_dataset" / "src_data4",
+        ]
+    )
+
+    for base in unique_items(candidates):
+        base = Path(base)
+        for ext in ("jpg", "jpeg", "png"):
+            candidate = base / frame_rel / f"8.{ext}"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def load_generation_model(model_name_or_path, device):
+    model = Qwen2VLForConditionalGeneration.from_pretrained(model_name_or_path, torch_dtype="auto")
+    model = model.to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
     return model, processor
 
-# 对输入文本进行编码并返回其嵌入
-def encode_text_with_clip(text, model, processor):
-    inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True)
+
+def load_clip_model(model_name_or_path, device):
+    processor = CLIPProcessor.from_pretrained(model_name_or_path)
+    model = CLIPModel.from_pretrained(model_name_or_path).to(device)
+    model.eval()
+    return model, processor
+
+
+def encode_text_with_clip(text, model, processor, device):
+    inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True).to(device)
     with torch.no_grad():
-        outputs = model.get_text_features(**inputs)
-    return outputs
+        return model.get_text_features(**inputs)
 
-# 生成 2-gram
+
 def generate_ngrams(text, n=2):
-    words = text.split()  # 拆分成单词
-    ngrams_list = list(ngrams(words, n))  # 生成2-gram
-    ngram_strings = [' '.join(ngram) for ngram in ngrams_list]  # 转为字符串形式
-    return ngram_strings
+    words = text.split()
+    return [" ".join(gram) for gram in ngrams(words, n)]
 
-# 计算关键词密度（包括2-gram）
-def calculate_keyword_density(text, keywords, model, processor, threshold=0.9):
-    # 预处理文本，去除标点符号并转换为小写
-    text = re.sub(r'[^\w\s]', '', text.lower())  # 转小写并去除标点
-    word_tokens = text.split()  # 将文本拆分为单词
-    unique_word_tokens = set(word_tokens)  # 获取唯一单词
-    total_unique_words = len(unique_word_tokens)  # 计算总唯一单词数
-    
-    if total_unique_words == 0:
-        return 0.0  # 如果文本没有单词，返回0
-    
-    ngrams_list = generate_ngrams(text, 2)
-    
-    all_tokens = unique_word_tokens.union(set(ngrams_list))
+
+def calculate_keyword_density(text, keywords, model, processor, device, threshold=0.9):
+    if not keywords:
+        return 0.0
+    text = re.sub(r"[^\w\s]", "", text.lower())
+    word_tokens = text.split()
+    unique_word_tokens = set(word_tokens)
+    if not unique_word_tokens:
+        return 0.0
+
+    all_tokens = unique_word_tokens.union(set(generate_ngrams(text, 2)))
     total_tokens = len(all_tokens)
-    
-    # 计算与每个关键词的相似度
     keyword_count = 0
-    
+
+    keyword_embeddings = [encode_text_with_clip(keyword, model, processor, device) for keyword in keywords]
     for token in all_tokens:
-        token_embedding = encode_text_with_clip(token, model, processor)
-        
-        # 对每个关键词计算与当前token的相似度
-        for keyword in keywords:
-            # 对关键词进行编码
-            keyword_embedding = encode_text_with_clip(keyword, model, processor)
-            
-            # 计算余弦相似度
-            similarity = cosine_similarity(token_embedding.detach().numpy(), keyword_embedding.detach().numpy())[0][0]
-            
-            # 如果相似度超过阈值，认为该token是关键词
+        token_embedding = encode_text_with_clip(token, model, processor, device)
+        for keyword_embedding in keyword_embeddings:
+            similarity = cosine_similarity(token_embedding.cpu().numpy(), keyword_embedding.cpu().numpy())[0][0]
             if similarity >= threshold:
                 keyword_count += 1
-                break  # 找到一个相似的关键词，跳出循环
-    
-    # 计算关键词密度：匹配的关键词数量 / 总的唯一单词数
-    keyword_density = keyword_count / total_tokens
-    return keyword_density
-
-# 加载模型和处理器
-model_clip, processor_clip = load_clip_model()
-
-# 加载视觉语言模型和处理器
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "", 
-    torch_dtype="auto",
-)
-
-processor = AutoProcessor.from_pretrained(
-    ""
-)
+                break
+    return keyword_count / total_tokens
 
 
-# 检查是否有可用的GPU
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-# 将模型转移到GPU（如果可用）
-model = accelerator.prepare(model)
-
-# 读取数据
-dataset_prefix = ""  # 修改为实际路径
-dataset_path_val = ""
-
-with open(dataset_prefix + dataset_path_val, 'r') as f:
-    sat_dataset_val = [json.loads(line.strip()) for line in f]
-
-# 用户消息模板
-user_message = "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. The prompt should:1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles).2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock).3. Provide specific details about objects (e.g., shape, size, material, distance).4. Include action suggestions (e.g., avoid, move forward, turn left).5. Prioritize safety and clarity. Output Prompt: "
-
-# ROUGE评分计算器
-scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
-
-def calculate_rouge(reference, generated):
-    scores = scorer.score(reference, generated)
-    return scores
-
-# gpt score
-
-def generate_text_from_image(image_path, user_message, keywords):
-    # 检查图像路径是否存在
-    if not os.path.exists(image_path):
-        print(image_path)
-        return None  # 跳过该样本
-    
-    # 加载图像
-    with Image.open(image_path).convert('RGB') as image:
-        image_data = np.array(image)  # 将图像转换为数组，假设模型接收此输入格式
-    
-    # 创建消息
+def generate_text_from_image(image_path, user_message, model, processor, device, max_new_tokens):
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": user_message}
+                {"type": "image", "image": str(image_path)},
+                {"type": "text", "text": user_message},
             ],
         }
     ]
-    
-    # 处理图像输入
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -167,76 +203,138 @@ def generate_text_from_image(image_path, user_message, keywords):
         padding=True,
         return_tensors="pt",
     )
-    inputs = inputs.to(accelerator.device)  # 将输入数据转移到GPU
+    inputs = inputs.to(device)
 
-    # 推理生成输出文本
-    generated_ids = model.generate(**inputs, max_new_tokens=1280)
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
     generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    
     return output_text[0]
 
-# 计算所有样本的平均指标
-total_rouge1, total_rouge2, total_rougel = 0, 0, 0
-total_keyword_density, total_perplexity, total_gpt_score = 0, 0, 0
-num_samples = len(sat_dataset_val)
 
-inference_results = []
+def maybe_compute_gpt_score(args, qwen_text, generated_text):
+    if not (args.gpt_appid and args.gpt_appkey and args.gpt_source and qwen_text):
+        return None
+    return evaluate_image(args.gpt_appid, args.gpt_appkey, args.gpt_source, qwen_text, generated_text)
 
-# 使用 tqdm 显示进度条
-for example in tqdm(sat_dataset_val, desc="Processing samples", ncols=100):
-    # 检查是否存在alter字段
-    if 'alter' not in example:
-        print("no alter")
-        continue  # 如果没有alter字段，跳过该样本
-    
-    image_path = dataset_prefix + "wad_dataset/src_data/" + example["frame_path"] + "/8.jpg"
-    reference = example["alter"]  # 标注文本
-    keywords = example["keywords"]
-    qwen_text = example["qwen72b_output"]
-    
-    # 生成模型的输出文本
-    generated_text = generate_text_from_image(image_path, user_message, keywords)
-    print(generated_text)
-    
-    # 如果没有生成文本（图片不存在或其他问题），跳过该样本
-    if generated_text is None:
-        continue
-    
-    # 计算ROUGE评分
-    print("re:", reference, "ge:", generated_text)
-    rouge_scores = calculate_rouge(reference, generated_text)
-    total_rouge1 += rouge_scores['rouge1'].fmeasure
-    total_rouge2 += rouge_scores['rouge2'].fmeasure
-    total_rougel += rouge_scores['rougeL'].fmeasure
-    
-    # 计算关键词密度
-    keyword_density = calculate_keyword_density(generated_text, keywords, model_clip, processor_clip)
-    total_keyword_density += keyword_density
-    
-    # 调用 GPT-4 进行打分 (GPT Score)
-    gpt_score = evaluate_image(appid, appkey, source, qwen_text, generated_text)
-    total_gpt_score += gpt_score
-    
-    inference_results.append({
-        "reference": reference,
-        "generated_text": generated_text,
-        "rouge_scores": rouge_scores,
-        "keyword_density": keyword_density,
-        "gpt_score": gpt_score  
-    })
 
-output_file = "inference_results_walkvlm.json"
-with open(output_file, 'w') as f:
-    json.dump(inference_results, f, ensure_ascii=False, indent=4)
+def run_evaluation(args):
+    annotation_path = Path(args.dataset_path).expanduser().resolve()
+    if not annotation_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {annotation_path}")
 
-# 输出平均指标
-print(f"Average ROUGE-1: {total_rouge1 / num_samples}")
-print(f"Average ROUGE-2: {total_rouge2 / num_samples}")
-print(f"Average ROUGE-L: {total_rougel / num_samples}")
-print(f"Average Keyword Density: {total_keyword_density / num_samples}")
-print(f"Average GPT Score: {total_gpt_score / num_samples}")  
+    dataset_root = Path(args.dataset_root).expanduser().resolve() if args.dataset_root else annotation_path.parent
+    image_root = Path(args.image_root).expanduser().resolve() if args.image_root else None
+    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    generation_model, processor = load_generation_model(args.model_name_or_path, device)
+    clip_model, clip_processor = load_clip_model(args.clip_model_name_or_path, device)
+    records = load_annotation_records(annotation_path)
+    if args.max_samples:
+        records = records[: args.max_samples]
+
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+    processed = 0
+    total_rouge1 = total_rouge2 = total_rougel = 0.0
+    total_keyword_density = total_gpt_score = 0.0
+    gpt_score_count = 0
+    results = []
+
+    for example in tqdm(records, desc="Evaluating", ncols=100):
+        reference = extract_reference(example)
+        frame_path = example.get("frame_path")
+        if reference is None or frame_path is None:
+            continue
+
+        image_path = resolve_image_path(frame_path, dataset_root, image_root)
+        if image_path is None:
+            continue
+
+        generated_text = generate_text_from_image(
+            image_path,
+            args.user_message,
+            generation_model,
+            processor,
+            device,
+            args.max_new_tokens,
+        )
+        rouge_scores = scorer.score(reference, generated_text)
+        keywords = extract_keywords(example)
+        keyword_density = calculate_keyword_density(
+            generated_text,
+            keywords,
+            clip_model,
+            clip_processor,
+            device,
+        )
+        gpt_score = maybe_compute_gpt_score(args, example.get("qwen72b_output"), generated_text)
+
+        processed += 1
+        total_rouge1 += rouge_scores["rouge1"].fmeasure
+        total_rouge2 += rouge_scores["rouge2"].fmeasure
+        total_rougel += rouge_scores["rougeL"].fmeasure
+        total_keyword_density += keyword_density
+        if gpt_score is not None:
+            total_gpt_score += gpt_score
+            gpt_score_count += 1
+
+        results.append(
+            {
+                "frame_path": frame_path,
+                "reference": reference,
+                "generated_text": generated_text,
+                "keywords": keywords,
+                "rouge1": rouge_scores["rouge1"].fmeasure,
+                "rouge2": rouge_scores["rouge2"].fmeasure,
+                "rougeL": rouge_scores["rougeL"].fmeasure,
+                "keyword_density": keyword_density,
+                "gpt_score": gpt_score,
+            }
+        )
+
+    if processed == 0:
+        raise RuntimeError("No valid evaluation samples were found. Please check dataset_path/image_root.")
+
+    summary = {
+        "num_samples": processed,
+        "average_rouge1": total_rouge1 / processed,
+        "average_rouge2": total_rouge2 / processed,
+        "average_rougeL": total_rougel / processed,
+        "average_keyword_density": total_keyword_density / processed,
+        "average_gpt_score": (total_gpt_score / gpt_score_count) if gpt_score_count else None,
+        "results": results,
+    }
+
+    output_path = Path(args.output_file).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(json.dumps({k: v for k, v in summary.items() if k != "results"}, ensure_ascii=False, indent=2))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate WalkStream reminder generation on a JSON/JSONL dataset.")
+    parser.add_argument("--model_name_or_path", required=True)
+    parser.add_argument("--dataset_path", required=True, help="Path to a test/eval JSON or JSONL annotation file.")
+    parser.add_argument("--dataset_root", default=None, help="Optional dataset root for resolving frame_path.")
+    parser.add_argument("--image_root", default=None, help="Optional explicit image root that contains frame folders.")
+    parser.add_argument("--clip_model_name_or_path", default="openai/clip-vit-base-patch16")
+    parser.add_argument("--output_file", default="inference_results_walkstream.json")
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--user_message", default=DEFAULT_USER_MESSAGE)
+    parser.add_argument("--gpt_appid", default=None)
+    parser.add_argument("--gpt_appkey", default=None)
+    parser.add_argument("--gpt_source", default=None)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run_evaluation(parse_args())

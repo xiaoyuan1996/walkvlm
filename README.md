@@ -8,7 +8,7 @@
 | Timeline | Project | Description |
 |---|---|---|
 | 📄 2024.12 | **WalkVLM** | CoT-based hierarchical planning + temporal-aware adaptive prediction. First large-scale WAD dataset (12k video–annotation pairs). *(arXiv:2412.20903)* |
-| 📄 2025.08 | **[WalkVLM-LR](./WalkVLM-LR/)** | Enhanced with EAD & human-preference reward functions, further reducing output & temporal redundancy. |
+| 📄 2025.08 | **[WalkVLM-LR](./WalkVLM-LR/)** | Legacy research snapshot with EAD and human-preference rewards. Kept for reference, but no longer the recommended reproducibility path. |
 | 🆕 2026.01 | **[WalkStream](./WalkStream/)** | Data & reward-enhanced low-latency VLM. 98k WRD clips, GRPO-based reward inference, decoupled async architecture — **52.6% latency reduction**. *(IJCV submitted)* |
 
 ##  🚀 Introduction
@@ -55,14 +55,13 @@ With the recent progress of **vision-language models (VLMs)**, applying them for
 ```
 .
 ├── wad_dataset               # Dataset used in WalkVLM
-├── WalkVLM-LR                # WalkVLM reasoning code
-│   ├── checkpoint            # Pretrained weights
-│   ├── vlm_grpo_template     # GRPO training template
-│   ├── EAD.py                # EAD model code
-│   ├── GPTScore.py           # GPTScore calculation code
-│   ├── inference.py          # Inference script
-│   ├── test.py               # Testing script
-│   └── train_EAD.py          # EAD model training script
+├── WalkVLM-LR                # Legacy research snapshot (archived entrypoints)
+│   ├── checkpoint            # Pretrained weights for archived LR experiments
+│   ├── vlm_grpo_template     # Archived GRPO template (kept for reference)
+│   ├── EAD.py                # EAD model definition
+│   ├── inference.py          # Archived inference wrapper
+│   ├── test.py               # Archived evaluation wrapper
+│   └── train_EAD.py          # Legacy EAD training artifact
 └── WalkStream                # 🆕 Latest: reward-enhanced low-latency VLM (IJCV submission)
     └── src/
         ├── otp/              # Online Triggered Prediction module

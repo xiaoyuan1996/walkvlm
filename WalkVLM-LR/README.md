@@ -1,96 +1,35 @@
-# WalkVLM-LR
+# WalkVLM-LR (Legacy Research Snapshot)
 
-A walking assistance VLM with reduced redundancy for blind and low vision individuals.
+This directory is preserved as an **archived research snapshot** of the earlier WalkVLM-LR codebase.
+It is **not** the recommended reproducibility path for this repository.
 
----
+## Current status
 
-## 📖 Overview
+- `vlm_grpo_template/` is archived and its old shell entrypoints now exit with a clear message instead of pretending to be runnable.
+- `test.py` and `inference.py` are archived wrappers kept only to make the non-reproducible status explicit.
+- The actively maintained training and evaluation path in this repository is now `../WalkStream/`.
 
-**WalkVLM-LR** is a walking assistance model designed to improve navigation for individuals with visual impairments.  
+## Recommended path
 
-✨ Key features:  
-- Reduces both **output** and **temporal redundancy** compared to existing models.  
-- Uses **human-preference-based custom reward functions** and an **environment awareness discriminator (EAD)**.  
-- Generates **concise, accurate, and context-appropriate guidance**, minimizing unnecessary reminders.  
-
-📊 Experimental results demonstrate that WalkVLM-LR outperforms other models in:  
-- **Output conciseness**  
-- **Reducing temporal redundancy**  
-
----
-
-## ⚙️ Installation
-
-### Prerequisites
-- CUDA **12.4**
-- Python **3.11**
-- PyTorch **2.6.0**
-
-### Setup
+If you want a runnable baseline from this repository, start from `../WalkStream/` instead:
 
 ```bash
-# Clone the repository
-git clone https://github.com/huggingface/open-r1.git
-
-# Install dependencies
-pip install --upgrade pip
-pip install vllm==0.8.5.post1
-pip install setuptools && pip install flash-attn --no-build-isolation
-GIT_LFS_SKIP_SMUDGE=1 pip install -e ".[dev]"
-```
-## 📂 Dataset & Pretrained Weights
-Before training or inference, configure the dataset and download pretrained weights:
-```bash
-# Download the dataset
-cd checkpoint
-bash download_wad.sh
-
-# Download pretrained weights
-cd checkpoint
-bash download_checkpoint.sh
-```
-The dataset will be placed in wad_dataset/ and pretrained weights in checkpoint/.
-
-## 🎯 Training
-
-We use GRPO to fine-tune WalkVLM-LR.
-
-### GRPO Training Command
-
-```bash
-# Run the training script
-cd vlm_grpo_template
-bash run_grpo_query_gene.sh
+cd ../WalkStream
 ```
 
-### GRPO Training Configuration
+Then follow:
 
-You can modify the training parameters in the `run_grpo_query_gene.sh` script, including:
-- output_dir
-- max_prompt_length
-- num_train_epochs
-- dataset_path 
+- `WalkStream/README.md`
+- `WalkStream/src/reminder_generation/README.md`
 
-### 🧩 EAD Training Command
-Configure the dataset path inside train_EAD.py, then run:
-```bash
-python -m torch.distributed.launch --nproc_per_node=8 train_EAD.py
-```
+## What remains here
 
-## 🧪 Testing Command
-Modify the checkpoint_path and image_paths in test.py, and then proceed with the testing. The pre-trained weights for CLIP and the related parameters for the GPT-4 API need to be configured manually.
-```bash
-python test.py
-```
-⚠️ The pretrained weights for CLIP and parameters for the GPT-4 API need to be configured manually.
+- `train_EAD.py`: legacy experiment code for the EAD module. It still requires manual dataset and training configuration and should be treated as a research artifact rather than a plug-and-play command.
+- `EAD.py`: model definition kept for reference.
+- `checkpoint/`: pretrained assets used by the archived LR experiments.
 
-## 🚀 Inference Command
-Modify the checkpoint_path and image_paths (with a limit of three images per input) in inference.py, and then perform the inference.
+## Why this directory is archived
 
-```bash
-python inference.py
-```
+The original WalkVLM-LR scripts mixed placeholder arguments, manual checkpoint edits, and non-standard local setup assumptions. Those files were easy to misread as reproducible entrypoints even though they were not ready for a clean checkout.
 
-## 📬 Contact
-
-For questions and feedback, please open an issue and contact.
+To reduce confusion, unsupported entry scripts in this directory have been converted into explicit archive notices.

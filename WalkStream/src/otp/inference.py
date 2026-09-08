@@ -1,96 +1,91 @@
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-import torch
+import argparse
 import json
-from qwen_vl_utils import process_vision_info
-from PIL import Image
+from pathlib import Path
+
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
-import torch.nn as nn
-import os
-from EAD import VisionDangerClassification  
+import torch
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+from otp_model import VisionDangerClassification
+
+
+LABELS = ["A", "B", "C"]
+DEFAULT_USER_MESSAGE = (
+    "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. "
+    "The prompt should: 1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles). "
+    "2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock). "
+    "3. Provide specific details about objects (e.g., shape, size, material, distance). "
+    "4. Include action suggestions (e.g., avoid, move forward, turn left). "
+    "5. Prioritize safety and clarity."
+)
+
 
 def convert_ndarray_to_list(obj):
     if isinstance(obj, np.ndarray):
-        return obj.tolist()  
-    elif isinstance(obj, dict):
+        return obj.tolist()
+    if isinstance(obj, dict):
         return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         return [convert_ndarray_to_list(item) for item in obj]
-    else:
-        return obj  
+    return obj
 
-def load_images_from_folder(folder, time_points):
-    images = {}
-    for time_point in time_points:
-        image_files = [
-            os.path.join(folder, f"{time_point:.2f}_{i+1}.jpg") for i in range(3)
-        ]
-        images[time_point] = [Image.open(image_file) for image_file in image_files if os.path.exists(image_file)]
-    return images
-
-def save_results_to_json(results, output_file=""):
-    results = convert_ndarray_to_list(results)  
-    with open(output_file, 'w') as f:
-        json.dump(results, f, ensure_ascii=False, indent=4)
-
-def get_time_points_from_folder(folder):
-    time_points = set()
-    for filename in os.listdir(folder):
-        if filename.endswith(".jpg"):
-            time_point = filename.split('_')[0]
-            time_points.add(float(time_point))
-    
-    return sorted(list(time_points))
 
 def remove_module_prefix(state_dict):
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    
-    for k, v in state_dict.items():
-        name = k[7:] if k.startswith("module.") else k  
-        new_state_dict[name] = v
-    
-    return new_state_dict
+    return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  
 
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "checkpoint_path", 
-    torch_dtype="auto", 
-).to(device)
-processor = AutoProcessor.from_pretrained(
-    "checkpoint_path"
-)
+def preprocess_image(image_path):
+    image = Image.open(image_path).convert("RGB")
+    target_size = (544, 960)
+    if image.size[0] > image.size[1]:
+        image = image.rotate(90, expand=True)
+    return image.resize(target_size)
 
-regression_head_model = VisionDangerClassification(input_dim=1536, num_classes=3)
-checkpoint_path = "checkpoint.pth"  
-checkpoint = torch.load(checkpoint_path)
-checkpoint['model_state_dict'] = remove_module_prefix(checkpoint['model_state_dict'])
 
-regression_head_model.load_state_dict(checkpoint['model_state_dict'])
-regression_head_model = regression_head_model.to(device)  
+def load_generator(model_name_or_path, device):
+    model = Qwen2VLForConditionalGeneration.from_pretrained(model_name_or_path, torch_dtype="auto")
+    model = model.to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    return model, processor
 
-regression_head_model = nn.DataParallel(regression_head_model, device_ids=list(range(torch.cuda.device_count())))
-model = nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))  
 
-def generate_text_from_image(image_path, user_message, model, processor):
-    if not os.path.exists(image_path):
-        print(f"Image not found: {image_path}")
-        return None  
-    
+def load_classifier(classifier_checkpoint, device):
+    if not classifier_checkpoint:
+        return None
+
+    checkpoint_path = Path(classifier_checkpoint).expanduser().resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Classifier checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = remove_module_prefix(state_dict)
+
+    model = VisionDangerClassification(input_dim=1536, num_classes=3)
+    model.load_state_dict(state_dict)
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def generate_text_from_image(image_path, user_message, model, processor, device, max_new_tokens):
+    image_path = str(Path(image_path).expanduser().resolve())
+    if not Path(image_path).exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image_path},
-                {"type": "text", "text": user_message}
+                {"type": "text", "text": user_message},
             ],
         }
     ]
-    
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
@@ -99,49 +94,33 @@ def generate_text_from_image(image_path, user_message, model, processor):
         padding=True,
         return_tensors="pt",
     )
-    inputs = inputs.to(device) 
+    inputs = inputs.to(device)
 
-    generated_ids = model.module.generate(**inputs, max_new_tokens=1280)
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
     generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
-    
     return output_text[0]
 
-def preprocess_image(image_path):
-    image = Image.open(image_path).convert("RGB")
-    target_size = (544, 960) 
-    
-    if image.size[0] > image.size[1]:  
-        image = image.rotate(90, expand=True)
-    else:
-        image = image.resize(target_size)
 
-    return image
-
-def infer_batch(image_paths):
-    images = [preprocess_image(image_path) for image_path in image_paths]
-
+def extract_visual_feature(image_path, model, processor, device):
+    image = preprocess_image(image_path)
     messages = [
         {
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
+                {"type": "image", "image": image},
                 {"type": "text", "text": "Describe this image."},
             ],
         }
-        for image in images
     ]
-    
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
-
     inputs = processor(
         text=[text],
         images=image_inputs,
@@ -149,55 +128,85 @@ def infer_batch(image_paths):
         padding=True,
         return_tensors="pt",
     )
+    inputs = inputs.to(device)
 
- 
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-
-    image_grid_thw = inputs['image_grid_thw']
-    grid_thw = inputs.get('image_grid_thw', None)
-    if grid_thw is None:
-        raise ValueError("grid_thw parameter is required for the visual model.")
-
-    visual_model = model.module.visual  
-    visual_features_list = []
     with torch.no_grad():
-        for i in range(len(images)):
-            a=int(inputs['pixel_values'].shape[0]/3)
-            image_feature = visual_model(hidden_states=inputs['pixel_values'][i*a:i*a+a], grid_thw=grid_thw[i:i+1])
-            visual_features_list.append(image_feature.unsqueeze(0))  
-    visual_features = torch.cat(visual_features_list, dim=0)
+        feature = model.visual(hidden_states=inputs["pixel_values"], grid_thw=inputs.get("image_grid_thw"))
 
-    visual_features = visual_features.to(torch.float32)
+    if feature.dim() == 3:
+        feature = feature.squeeze(0)
+    return feature.detach().to(torch.float32)
 
-    logits = regression_head_model(visual_features)  
-    predicted_classes = torch.argmax(logits, dim=1)  
 
-    label_encoder = LabelEncoder()
-    label_encoder.fit(["A", "B", "C"])
-    predicted_labels = label_encoder.inverse_transform(predicted_classes.tolist())
+def predict_trigger_labels(image_paths, classifier_model, generator_model, processor, device):
+    features = [extract_visual_feature(image_path, generator_model, processor, device) for image_path in image_paths]
+    max_len = max(feature.size(0) for feature in features)
+    hidden_size = features[0].size(1)
+    padded = torch.zeros(len(features), max_len, hidden_size, dtype=torch.float32, device=device)
+    for idx, feature in enumerate(features):
+        padded[idx, : feature.size(0)] = feature.to(device)
 
-    return predicted_labels
+    with torch.no_grad():
+        logits = classifier_model(padded)
+        predicted_classes = torch.argmax(logits, dim=1).tolist()
+    return [LABELS[pred] for pred in predicted_classes]
 
-def infer_with_check(image_paths, predictions, model, processor):
-    if 'C' in predictions:
-        image_path = image_paths[-1]  
-        user_message = "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. The prompt should:1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles).2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock).3. Provide specific details about objects (e.g., shape, size, material, distance).4. Include action suggestions (e.g., avoid, move forward, turn left).5. Prioritize safety and clarity. "
-        generated_text = generate_text_from_image(image_path, user_message, model, processor)
-        return generated_text
-    else:
-        return "No reminder needed"  
-    
-def infer_with_check_other_model(image_paths,model, processor):
-    image_path = image_paths[-1]  
-    user_message = "Given the input image, generate a clear and concise navigation prompt for visually impaired individuals. The prompt should:1. Identify key elements in the environment (e.g., obstacles, landmarks, pedestrians, vehicles).2. Use clear directional terms (e.g., left, right, front, or clock directions like 1 o'clock).3. Provide specific details about objects (e.g., shape, size, material, distance).4. Include action suggestions (e.g., avoid, move forward, turn left).5. Prioritize safety and clarity."  
-    generated_text = generate_text_from_image(image_path, user_message, model, processor)
-    return generated_text
 
-image_paths = [
-    "",
-    "",
-    ""
-]  
-predictions = infer_batch(image_paths)
-result = infer_with_check(image_paths, predictions, model, processor)
-print(result) 
+def run_inference(args):
+    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+    image_paths = [str(Path(path).expanduser().resolve()) for path in args.image_paths]
+    for image_path in image_paths:
+        if not Path(image_path).exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+    generator_model, processor = load_generator(args.model_name_or_path, device)
+    classifier_model = load_classifier(args.classifier_checkpoint, device)
+
+    predicted_labels = []
+    should_generate = args.always_generate or classifier_model is None
+    if classifier_model is not None:
+        predicted_labels = predict_trigger_labels(image_paths, classifier_model, generator_model, processor, device)
+        should_generate = should_generate or ("C" in predicted_labels)
+
+    reminder = "No reminder needed"
+    if should_generate:
+        reminder = generate_text_from_image(
+            image_paths[-1],
+            args.user_message,
+            generator_model,
+            processor,
+            device,
+            args.max_new_tokens,
+        )
+
+    result = {
+        "image_paths": image_paths,
+        "predicted_labels": predicted_labels,
+        "should_generate": should_generate,
+        "reminder": reminder,
+    }
+
+    if args.output_json:
+        output_path = Path(args.output_json).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(convert_ndarray_to_list(result), f, ensure_ascii=False, indent=2)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run WalkStream OTP inference on 1-3 images.")
+    parser.add_argument("--model_name_or_path", required=True, help="Path or Hugging Face ID of the VLM checkpoint.")
+    parser.add_argument("--image_paths", nargs="+", required=True, help="One to three image paths ordered by time.")
+    parser.add_argument("--classifier_checkpoint", default=None, help="Optional OTP classifier checkpoint path.")
+    parser.add_argument("--device", default=None, help="Optional torch device, e.g. 'cuda:0' or 'cpu'.")
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--always_generate", action="store_true", help="Generate reminder text even without OTP gating.")
+    parser.add_argument("--user_message", default=DEFAULT_USER_MESSAGE)
+    parser.add_argument("--output_json", default=None, help="Optional path to save the inference result JSON.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run_inference(parse_args())

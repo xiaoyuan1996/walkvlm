@@ -1,12 +1,13 @@
 import base64
 import io
+import json
+import os
 import openai
 import requests
 from PIL import Image
 from time import time
 import hashlib
 import hmac
-import json
 
 
 # 计算授权签名（用于GPT-4调用）
@@ -71,7 +72,12 @@ def call_gpt4(input_text, appid, appkey, source):
         "max_tokens": 50
     })
 
-    response = requests.post("xxx.url", data=content, headers=headers)
+    score_url = os.getenv("GPT_SCORE_URL")
+    if not score_url:
+        raise RuntimeError("GPT_SCORE_URL is not set. Please export the scoring service URL before enabling GPT score.")
+
+    response = requests.post(score_url, data=content, headers=headers)
+    response.raise_for_status()
     result = json.loads(response.text)
     return float(result['response'])
 
