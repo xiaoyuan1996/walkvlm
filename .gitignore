@@ -3,4 +3,4 @@ wad_dataset/wad_dataset.tar
 vlm_grpo_template/output/*
 vlm_grpo_template/trajectories/*
 vlm_grpo_template/wandb/*
-**/__pycache__/
+**/__pycache__/.DS_Store
